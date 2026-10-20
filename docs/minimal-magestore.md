@@ -89,7 +89,8 @@ Omitting `spec.bootstrap` is what tells the operator the
 database is already populated. With `spec.bootstrap` set on a
 pre-bootstrapped DB, `setup:install` would refuse and the
 StoreInstalled condition would surface
-`BootstrapFailed`.
+`PermanentlyFailed` (after the Job retries
+exhaust their backoff budget).
 
 ## What's not in these examples
 
