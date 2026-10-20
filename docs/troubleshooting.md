@@ -14,8 +14,9 @@ kubectl get magestore <name> -o yaml
 
 The `status.conditions` list has one entry per top-level concern:
 `DatabaseReady`, `SearchReady`, `CacheReady`, `QueueReady`,
-`SecretsReady`, `StoreInstalled`, `WorkloadsReady`, `VarnishReady`,
-`ConsumersReady`, `CronReady`, plus the `Ready` rollup. Each entry's
+`SecretsReady`, `StoreInstalled`, `SMTPReady`, `MediaSeeded`,
+`URLsApplied`, `WorkloadsReady`, `VarnishReady`, `ConsumersReady`,
+`CronReady`, plus the `Ready` rollup. Each entry's
 `reason` and `message` are the data points below.
 
 ## DependencyOperatorMissing — the cluster lacks the operator you opted into
@@ -126,7 +127,9 @@ store.
 | `JobCreateFailed` | The setup:install Job failed to apply. | Read the message. |
 | `BootstrapInProgress` | The Job is running. | `kubectl logs job/<store>-bootstrap` for live progress. |
 | `BootstrapComplete` | Healthy. | — |
-| `BootstrapFailed` | The Job's pod failed. | `kubectl logs job/<store>-bootstrap` — typical causes: unreachable database, schema drift, invalid admin email. |
+| `RetryingFailedJob` | The Job's pod failed but is still inside its backoff window; the operator recreates it at `NextAttemptAt`. | `kubectl logs job/<store>-bootstrap` — typical causes: unreachable database, schema drift, invalid admin email. |
+| `RecreatingFailedJob` | The failed Job was just deleted; the next reconcile recreates it. | Transient — watch the next reconcile; investigate the pod logs if it repeats. |
+| `PermanentlyFailed` | The Job exhausted its retry budget. | `kubectl logs job/<store>-bootstrap`, fix the root cause, then delete the failed Job to start a fresh retry cycle. |
 
 ## WorkloadsReady reasons
 
@@ -175,6 +178,52 @@ Per-group CronJobs materialised when `spec.cron.enabled: true`.
 | `AwaitingDependencies` | SecretsReady / StoreInstalled is False. | Resolve the upstream conditions. |
 | `UnknownCronGroupOverride` | `spec.cron.overrides` references a group name not on the operator's known-good list. | Run `bin/magento cron:run --help` against the image to list valid group names. |
 | `AllReady` | Healthy. | — |
+
+## SMTPReady reasons
+
+The outbound-email step, materialised when `spec.smtp` is set. The
+operator renders the `SMTP_*` Secret (inline mode) or validates your
+own (`secretRef` mode), then runs a one-shot probe Job that verifies
+the relay is reachable.
+
+| Reason | What it means | What to check |
+|---|---|---|
+| `SecretNameCollision` | A Secret named `<store>-smtp` already exists and is not operator-managed (missing the `app.kubernetes.io/managed-by` label). | Rename your Secret or delete it so the operator can manage SMTP. |
+| `PasswordRefNotFound` | The Secret referenced by `spec.smtp.inline.passwordSecretRef` does not exist. | Create the Secret, or fix the name/key in the spec. |
+| `SecretNotFound` | The Secret referenced by `spec.smtp.secretRef` does not exist. | Create the Secret in the store's namespace. |
+| `SecretMissingKeys` | Your `secretRef` Secret lacks the required `SMTP_HOST` and/or `SMTP_FROM` keys. | Add the missing keys to the Secret. |
+| `Probing` | The probe Job is running (condition Unknown). | `kubectl logs job/<store>-smtp-probe` for live progress. |
+| `Ready` | Healthy — the probe Job reached the relay. | — |
+| `ProbeFailed` | The probe Job completed with a failure. | `kubectl logs job/<store>-smtp-probe` — typical causes: wrong host/port, TLS mode rejected by the relay, bad credentials. |
+| `RetryingFailedJob` / `RecreatingFailedJob` / `PermanentlyFailed` | The probe Job failed; see the shared Job-recovery semantics under StoreInstalled. | `kubectl logs job/<store>-smtp-probe`. |
+
+## MediaSeeded reasons
+
+`spec.media.seedFromImage` populates the media backend from the
+image's `/app/pub/media-baked/*` on initial install: via workload
+initContainer for `emptyDir`/`pvc`, via a one-shot Job for `s3`.
+
+| Reason | What it means | What to check |
+|---|---|---|
+| `AwaitingSecrets` | Waiting for SecretsReady=True before creating the S3 media-seed Job. | Resolve the SecretsReady condition. |
+| `Seeding` | The seed Job is running, or the operator is waiting for workloads to become ready so their initContainer can seed. | `kubectl logs job/<store>-media-seed` (s3 mode) for live progress. |
+| `SeedComplete` | Healthy. | — |
+| `SeedFailed` | The seed Job completed with a failure. | `kubectl logs job/<store>-media-seed`. |
+| `RetryingFailedJob` / `RecreatingFailedJob` / `PermanentlyFailed` | The seed Job failed; see the shared Job-recovery semantics under StoreInstalled. | `kubectl logs job/<store>-media-seed`. |
+
+## URLsApplied reasons
+
+After bootstrap, a one-shot store-URLs Job applies the ADR 013 base
+URLs (`web/unsecure/base_url` / `web/secure/base_url`) derived from
+`spec.stores` and `spec.routing.tls`. The condition is omitted until
+the store is installed.
+
+| Reason | What it means | What to check |
+|---|---|---|
+| `Applying` | The store-URLs Job is running. | `kubectl logs job/<store>-store-urls` for live progress. |
+| `Applied` | Healthy — base URLs are set. | — |
+| `ApplyFailed` | The Job completed with a failure. | `kubectl logs job/<store>-store-urls` — typical causes: store unreachable, `config:set` rejected a derived URL. |
+| `RetryingFailedJob` / `RecreatingFailedJob` / `PermanentlyFailed` | The store-URLs Job failed; see the shared Job-recovery semantics under StoreInstalled. | `kubectl logs job/<store>-store-urls`. |
 
 ## Ready (rollup) reasons
 
