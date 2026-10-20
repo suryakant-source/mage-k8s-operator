@@ -28,10 +28,12 @@ spec:
   cache:        # optional — Redis / Valkey / external
   queue:        # optional — RabbitMQ / external
   consumers:    # optional — requires spec.queue
+  smtp:         # optional — outbound email (ADR 012)
   cron:         # optional — Magento cron groups as CronJobs
-  media:        # optional — S3 / PVC / unset (emptyDir)
+  media:        # optional — S3 / PVC / emptyDir
   varnish:      # optional — caching layer in front of /
   bootstrap:    # optional but needed for fresh installs
+  upgrade:      # optional — setup:upgrade orchestration on image-tag drift
 ```
 
 The discriminated-union stanzas (`database`, `search`, `cache`,
@@ -71,6 +73,7 @@ their HTTPRoute paths fall through to the frontend Service.
 | `frontend` | `WorkloadSpec` | — | The storefront-serving workload. Required. |
 | `admin` | `WorkloadSpec` | unset | Split out for stores whose admin traffic must not contend with storefront traffic. |
 | `api` | `WorkloadSpec` | unset | Split out for stores with materially different REST/GraphQL traffic profiles. |
+| `imagePullPolicy` | enum (`Always`, `IfNotPresent`, `Never`) | `Always` | Pull policy for every pod the operator runs from the store's image: the workloads, queue consumers, Varnish, and the one-shot Jobs (bootstrap, smtp probe, store-urls, media seed, upgrade). Set `IfNotPresent` for air-gapped or rate-limited registries, or `Never` for node-local images such as `kind load docker-image`. |
 
 Each `WorkloadSpec`:
 
@@ -289,8 +292,7 @@ reachable search endpoint at `setup:install`. Two modes:
 |---|---|
 | `openSearch` | Operator provisions an OpenSearchCluster CR (via opensearch-operator). |
 | `opensearchRef` | Admin pre-created the OpenSearchCluster CR. |
-
-(External-mode OpenSearch is not yet supported.)
+| `external` | Unmanaged OpenSearch/Elasticsearch endpoint (AWS OpenSearch Service, Bonsai, ...). |
 
 ### `spec.search.openSearch` (inline)
 
@@ -311,6 +313,29 @@ spec:
       resources:
         requests: { cpu: 500m, memory: 2Gi }
         limits: { memory: 3Gi }
+```
+
+### `spec.search.external` (unmanaged)
+
+An OpenSearch/Elasticsearch endpoint you run yourself. The operator
+does no provisioning, no watching, and no readiness checks — it only
+validates the optional credentials Secret and threads the values into
+the config Secret.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `host` | string | — | Hostname (or address), no protocol prefix, no trailing port. Required. |
+| `port` | int (1-65535) | 9200 | HTTP port. AWS OpenSearch Service typically listens on 443; Bonsai commonly exposes 9200. |
+| `credentialsSecretRef.name` | string | unset | Optional Secret with `username` + `password` keys for basic auth. Leave unset for no-auth endpoints. Surfaces `SearchReady=False` (`CredentialSecretMissing` / `CredentialKeyEmpty`) when unresolvable. |
+
+```yaml
+spec:
+  search:
+    external:
+      host: my-domain.eu-west-1.es.amazonaws.com
+      port: 443
+      credentialsSecretRef:
+        name: store-opensearch-creds
 ```
 
 ## `spec.cache` — optional
@@ -414,6 +439,61 @@ spec:
           limits: { memory: 2Gi }
 ```
 
+## `spec.smtp` — optional
+
+Outbound email per ADR 012. When unset, no SMTP is configured and
+Magento's mail sending stays disabled — demo stores then need
+`spec.bootstrap.admin.disableTFA: true` to keep admin login working.
+Two-sibling union; exactly one of:
+
+| Sibling | Use when |
+|---|---|
+| `inline` | Operator constructs the per-store SMTP Secret from the fields below. |
+| `secretRef` | You manage the Secret with the `SMTP_*` keys yourself. |
+
+### `spec.smtp.inline`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `host` | string | — | SMTP relay hostname. Required. |
+| `from` | string (email format) | — | Default From: email and SMTP envelope MAIL FROM. Required. There is deliberately no operator-side fallback to `bootstrap.admin.email`. |
+| `fromName` | string | unset | Default From: header display name. |
+| `port` | int | 587 | SMTP port. |
+| `user` | string | unset | Auth username. Anonymous / IP-allowlist relays leave `user` and `passwordSecretRef` unset — CEL enforces both-set or both-unset. |
+| `passwordSecretRef` | `SecretKeySelector` | unset | Secret with the SMTP password (default key: `password`). |
+| `auth` | enum (`login`, `plain`, `cram-md5`) | `login` | SMTP auth mechanism. |
+| `tls` | enum (`starttls`, `tls`, `off`) | `starttls` | Transport security. |
+| `fromIdentities` | `SMTPFromIdentities` | unset | Per-identity From: overrides for Magento's five built-in `trans_email` identities (`general`, `sales`, `support`, `custom1`, `custom2`); each entry takes `email` + `name`, and set keys must be non-blank. |
+
+```yaml
+spec:
+  smtp:
+    inline:
+      host: smtp.mailgun.org
+      from: store@example.com
+      fromName: My Shop
+      user: postmaster@mg.example.com
+      passwordSecretRef:
+        name: smtp-creds
+      fromIdentities:
+        sales:
+          email: orders@example.com
+          name: My Shop Orders
+```
+
+### `spec.smtp.secretRef` (bring your own Secret)
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `name` | string | — | Name of a Secret in the store's namespace carrying the `SMTP_*` keys directly. `SMTP_HOST` and `SMTP_FROM` must be present; the operator validates them at reconcile time. |
+
+```yaml
+spec:
+  smtp:
+    secretRef:
+      name: my-smtp-secret
+```
+
 ## `spec.cron` — optional
 
 Per-group CronJobs for Magento's cron groups. Each declared group
@@ -453,16 +533,21 @@ spec:
 ## `spec.media` — optional
 
 Object storage for Magento's `pub/media` directory (product
-images, generated thumbnails, wysiwyg uploads). Two-sibling union
-per ADR 004:
+images, generated thumbnails, wysiwyg uploads). Three-way union
+per ADR 011 — exactly one sibling must be set:
 
 | Sibling | Use when |
 |---|---|
 | `s3` | **Production default.** S3-compatible object storage (AWS S3, Scaleway Object Storage, Wasabi, Minio, Cloudflare R2, ...). |
 | `pvc` | Dev/test only. RWO PVC mounted at pub/media. RWX is documented as known-corruption at scale. |
+| `emptyDir` | Per-pod scratch. Marker struct, reserved for future tuning fields. |
 
-When `spec.media` is unset, the operator mounts an `emptyDir` —
-ephemeral, demos only.
+When `spec.media` is unset, the operator falls back to per-pod
+`emptyDir` scratch — ephemeral, demos only.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `seedFromImage` | bool | false | Populate the configured backend with the workload image's `/app/pub/media-baked/*` on initial install. Volume modes (`emptyDir`, `pvc`) seed via initContainer; `s3` runs a one-shot Job. |
 
 ### `spec.media.s3` (object storage)
 
@@ -546,6 +631,7 @@ store needs `spec.bootstrap`.**
 | `lastName` | string | `User` | Admin last name. |
 | `username` | string | `admin` | Admin username. |
 | `passwordSecretRef` | `SecretKeySelector` | unset | Secret with the initial password (default key: `password`). Leave unset to have the operator generate a 20-char random password and store it in `<store>-admin`. |
+| `disableTFA` | bool | false | Opt out of two-factor authentication after `setup:install`. Demo manifests without an SMTP relay set this `true` to keep admin login working; production stores with `spec.smtp` configured leave it `false` and use real TFA enrolment via email. |
 
 ```yaml
 spec:
@@ -653,9 +739,6 @@ These are deferred to later releases:
 - `spec.consumers.extras[]` — adding consumers beyond the known
   Magento 2.4.8 list. Until then, unknown override keys surface
   via `ConsumersReady=False, Reason=UnknownConsumerOverride`.
-- `spec.email.smtpSecretRef` — first-class SMTP wiring. Today,
-  workloads pick up an optional `<store>-smtp` Secret if it
-  exists; see [`internals/local-smtp.md`](internals/local-smtp.md).
 - `spec.secrets.provider: external-secrets` — External Secrets
   Operator integration. Phase-2 work.
 - `MageIndex`, `MageBackup`, `MageRestore` — separate CRDs for
