@@ -50,9 +50,12 @@ across operator releases; if we need to change one, it's an ADR.
 | `MAGE_MODE`                 | Hard-coded `production` today                         | Will be driven by `spec.deploymentMode` once that field lands.                           |
 | `MAGENTO_OPENSEARCH_HOST`   | `spec.search.openSearch` (inline) or `opensearchRef`  | Resolved via `ensureSearch`; only emitted once `SearchReady=True`. Hostname only.        |
 | `MAGENTO_OPENSEARCH_PORT`   | same                                                  | Default `9200`.                                                                          |
+| `MAGENTO_OPENSEARCH_USERNAME` | `spec.search.external.credentialsSecretRef[username]` | Only emitted for an external endpoint with credentials set. **Not emitted** for no-auth endpoints; `env.php` must honour absence as "connect without basic auth". |
+| `MAGENTO_OPENSEARCH_PASSWORD` | `spec.search.external.credentialsSecretRef[password]` | Same emission rule as the username.                                                      |
 | `MAGENTO_REDIS_HOST`        | `spec.cache` (all three modes) → Service name or `external.host` | Resolved via `ensureCache`; only emitted once `CacheReady=True`. Hostname only.          |
 | `MAGENTO_REDIS_PORT`        | same                                                  | Default `6379`; `external.port` overrides.                                               |
 | `MAGENTO_REDIS_PASSWORD`    | Inline: operator-generated Secret (key `password`, same name as Valkey CR). Ref: same. External: `external.passwordSecretRef`. | **Not emitted** when the endpoint is password-less (ExternalCache without `passwordSecretRef`). Image must honour absence as "connect without AUTH". |
+| `MAGENTO_REDIS_SENTINEL_MASTER` | Inline HA mode (ADR 009): the Sentinel master name | Only emitted in inline-HA mode. When set, `env.php` MUST switch `Cm_Cache_Backend_Redis` into Sentinel-discovery mode or the HA cache does not work — the reference image does this. |
 | `MAGENTO_RABBITMQ_HOST`     | `spec.queue` (all three modes) → Service name or `external.host` | Resolved via `ensureQueue`; only emitted once `QueueReady=True`. Hostname only.          |
 | `MAGENTO_RABBITMQ_PORT`     | same                                                  | Default `5672`; `external.port` overrides.                                               |
 | `MAGENTO_RABBITMQ_VHOST`    | Hard-coded `/` for inline/ref; `external.vhost` (default `/`) | AMQP virtual host. Magento Phase-1 always uses the default vhost.                        |
@@ -156,11 +159,32 @@ emitted, otherwise falls back to the local-disk `file` driver
 (matching what the mounted volume — emptyDir or PVC — provides
 at `/app/pub/media`).
 
+### Outbound email (emitted when `spec.smtp` is set)
+
+The operator renders these into the per-store SMTP Secret (inline
+mode) or expects them in your `secretRef` Secret. `env.php` should
+map them onto Magento's `system/smtp` or the `SMTP_*`-aware mail
+transport.
+
+| Variable                   | Source                                             | Notes                                                                                     |
+|----------------------------|----------------------------------------------------|-------------------------------------------------------------------------------------------|
+| `SMTP_HOST`                | `spec.smtp.inline.host`                            | SMTP relay hostname. Always emitted when `spec.smtp` is set.                              |
+| `SMTP_PORT`                | `spec.smtp.inline.port`                            | Default `587`.                                                                            |
+| `SMTP_FROM`                | `spec.smtp.inline.from`                            | Default From: address and envelope MAIL FROM.                                             |
+| `SMTP_FROM_NAME`           | `spec.smtp.inline.fromName`                        | Emitted only when set.                                                                    |
+| `SMTP_AUTH`                | `spec.smtp.inline.auth`                            | One of `login`, `plain`, `cram-md5`. Default `login`.                                     |
+| `SMTP_TLS`                 | `spec.smtp.inline.tls`                             | One of `starttls`, `tls`, `off`. Default `starttls`.                                      |
+| `SMTP_USERNAME`            | `spec.smtp.inline.user`                            | Emitted only when auth is configured (CEL enforces `user` + `passwordSecretRef` parity).  |
+| `SMTP_PASSWORD`            | `spec.smtp.inline.passwordSecretRef`               | Emitted together with `SMTP_USERNAME`.                                                    |
+| `SMTP_FROM_<IDENT>`        | `spec.smtp.inline.fromIdentities.<ident>.email`    | Per-identity From: override. `<IDENT>` is one of `GENERAL`, `SALES`, `SUPPORT`, `CUSTOM1`, `CUSTOM2`; only explicitly set identities are emitted. |
+| `SMTP_FROM_NAME_<IDENT>`   | `spec.smtp.inline.fromIdentities.<ident>.name`     | Same emission rule as `SMTP_FROM_<IDENT>`.                                                |
+
 ### Planned (as ensure* steps land)
 
-| Variable                       | Status         | Notes                                                           |
-|--------------------------------|----------------|-----------------------------------------------------------------|
-| `MAGENTO_BASE_URL`             | Planned Day 8  | Derived from `spec.stores[].host` + ingress TLS.                |
+No variable is currently planned. Base URLs are deliberately **not**
+an env var: ADR 013 derives them from `spec.stores[].host` +
+`spec.routing.tls` and applies them post-install with a one-shot
+store-URLs Job (`bin/magento config:set web/unsecure/base_url ...`).
 
 Images are free to read env vars that don't exist yet — `getenv()` returns
 `false`, and a thoughtful `env.php` uses `getenv(...) ?: $default`. That's
